@@ -23,29 +23,36 @@ class Camera_Subscriber(Node):
             10)
         self.subscription
 
-        self.img_publisher = self.create_publisher(Image, "/human_tracker", 1)
+        self.img_publisher = self.create_publisher(Image, "/human_tracker", 10)
 
     def camera_callback(self, data):
-        global frame
         frame = bridge.imgmsg_to_cv2(data, "bgr8")
-        tracker = human_tracker(frame)
+        tracker, flag = human_tracker(frame)
+        if not flag:
+            return self.img_publisher.publish(data)
         img_msg = bridge.cv2_to_imgmsg(tracker)
         self.img_publisher.publish(img_msg)
+
 
 def human_tracker(frame):
     results = MODEL(frame, classes=0)
     frame_ = results[0].plot()
+        
+    boxes = results[0].boxes.xyxy.tolist()
+
+    if not boxes:
+        print("error")
+        return None, False
+
+    boxes = boxes[0]
     
-    # boxes = results[0].boxes.xyxy.tolist()
-    # boxes = boxes[0]
+    # person coordinates
+    X_p = int(boxes[2] + boxes[0]) // 2
+    Y_p = int(boxes[3] + boxes[1]) // 2
     
-    # # person coordinates
-    # X_p = int(boxes[2] + boxes[0]) // 2
-    # Y_p = int(boxes[3] + boxes[1]) // 2
-    
-    # # drawing human body center 
-    # cv2.circle(frame_, (X_p, Y_p), 5, (255, 0, 0))
-    return frame_
+    # drawing human body center 
+    cv2.circle(frame_, (X_p, Y_p), 5, (255, 0, 0))
+    return frame_, True
 
 def main(args=None):
     rclpy.init(args=args)
