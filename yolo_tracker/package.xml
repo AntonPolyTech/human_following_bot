@@ -14,7 +14,10 @@
   <exec_depend>cv2</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>numpy</exec_depend>
-  <!-- <exec_depend>threading</exec_depend> -->
+  <exec_depend>ros2_numpy</exec_depend>
+  <exec_depend>functools</exec_depend>
+  <exec_depend>genpy</exec_depend>
+  <exec_depend>collections</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
