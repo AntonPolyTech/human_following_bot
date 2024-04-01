@@ -18,9 +18,9 @@ _P_2D = None
 
 bridge = CvBridge()
 
-K = np.array([[0, 0, 0],
-              [0, 0, 0],
-              [0, 0, 0]])
+K = np.array([[528.434, 0, 320.5],
+              [0, 528.434, 240.5],
+              [0, 0, 1]])
 
 class Camera_Subscriber(Node):
 
@@ -59,8 +59,12 @@ class Camera_Subscriber(Node):
     def pc2_callback(self, data):
         
         global _P_2D
+        
         xyz_array = pointcloud2_to_xyz_array(data)
-        print(xyz_array[640 * _P_2D[1] + _P_2D[0]])   
+        P_3D = xyz_array[640 * _P_2D[1] + _P_2D[0]]
+        print('P_3D = ', P_3D)
+
+
         
 
 
