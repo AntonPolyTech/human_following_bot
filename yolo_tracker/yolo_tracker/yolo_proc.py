@@ -3,19 +3,20 @@ import supervision as sv
 import cv2
 import numpy as np
 import message_filters
+import tf2_ros
 
 from ultralytics import YOLO
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2
 from tracker_msgs.msg import RgbPc2, RgbDepth
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, PoseStamped, Quaternion
 from std_msgs.msg import Int64MultiArray
 from cv_bridge import CvBridge
 from .submodules.point_cloud2 import pointcloud2_to_xyz_array
-
+from nav_msgs.msg import Odometry
 
 # wheights for NN
-MODEL = YOLO('weights/yolov8s.pt')
+MODEL = YOLO('weights/yolov8n.pt')
 
 human_detected = False
 
@@ -27,6 +28,7 @@ T_p = 0
 
 bridge = CvBridge()
 
+
 K = np.array([[528.434, 0, 320.5],
               [0, 528.434, 240.5],
               [0, 0, 1]])
@@ -36,6 +38,8 @@ class Camera_Subscriber(Node):
     def __init__(self):
 
         super().__init__('camera_subscriber')
+
+        self.SAFE_DISTANCE = 1 #meters
 
         self.subscription1 = self.create_subscription(
             RgbPc2,
@@ -50,9 +54,14 @@ class Camera_Subscriber(Node):
         #     self.EKF_callback,
         #     10)
         # self.subscription3
-
+        
+        # Sub
+        self.odom_sub = self.create_subscription(Odometry, '/odom', 10)
+        
+        # Pub
         self.img_publisher = self.create_publisher(Image, '/yolo_detection', 10)
         self.rgb_depth_publisher = self.create_publisher(RgbDepth, '/rgb_depth_sync', 10)
+        self.goal_pose_publisher = self.create_publisher(PoseStamped, '/goal_pose', 10)
 
         T_p = self.get_clock().now()
         T_p # to prevent unused variable warning
@@ -63,7 +72,6 @@ class Camera_Subscriber(Node):
         self.ts = message_filters.TimeSynchronizer([self.image_sub, self.depth_sub], 10)
         self.ts.registerCallback(self.cam_callback)
 
-
     def rgb_pc2_callback(self, data):
               
         global _P_2D, _P_3D
@@ -72,8 +80,20 @@ class Camera_Subscriber(Node):
             return None
         
         xyz_array = pointcloud2_to_xyz_array(data.pc2)
-        _P_3D = xyz_array[640 * _P_2D[1] + _P_2D[0]]
+        _P_3D = xyz_array[data.rgb.width * _P_2D[1] + _P_2D[0]]
         print('P_3D = ', _P_3D)
+
+        pose = PoseStamped()
+        pose.pose.position.x = _P_3D[0]
+        pose.pose.position.y = _P_3D[1]
+        pose.pose.position.z = self.SAFE_DISTANCE
+
+        q = Quaternion()
+        q.setRPY(0, 0, 0)
+        pose.pose.orientation.x = q.x()
+        pose.pose.orientation.x = q.y()
+        pose.pose.orientation.x = q.z()
+        pose.pose.orientation.x = q.w()
 
 
     def cam_callback(self, _rgb, _depth):
@@ -92,7 +112,6 @@ class Camera_Subscriber(Node):
         rgb_depth.rgb = _rgb
         rgb_depth.depth = _depth
         self.rgb_depth_publisher.publish(rgb_depth)
-
  
     def human_tracker(self, frame):
         
@@ -120,16 +139,9 @@ class Camera_Subscriber(Node):
         cv2.circle(frame_, (X_p, Y_p), 5, (255, 0, 0))
         return frame_, P_2d
     
-    def find_p3D(self, data):
+# def calculateYaw(x, z):
+    
       
-        global _P_2D, _P_3D
-        if _P_2D == None:
-            return None
-        
-        xyz_array = pointcloud2_to_xyz_array(data)
-        _P_3D = xyz_array[640 * _P_2D[1] + _P_2D[0]]
-        print('P_3D = ', _P_3D)
-
 
 def main(args=None):
 
