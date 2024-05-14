@@ -3,31 +3,74 @@ import supervision as sv
 import cv2
 import numpy as np
 import message_filters
+import rclpy.time
+import tf2_ros
+import math
 
 from ultralytics import YOLO
 from rclpy.node import Node
-from sensor_msgs.msg import Image, PointCloud2, LaserScan
+from sensor_msgs.msg import Image, PointCloud2
 from tracker_msgs.msg import RgbPc2, RgbDepth
-from geometry_msgs.msg import Twist, PoseStamped, Quaternion
+from geometry_msgs.msg import Twist, PoseStamped, Quaternion, PointStamped, Vector3
 from cv_bridge import CvBridge
 from .submodules.point_cloud2 import pointcloud2_to_xyz_array
-from nav_msgs.msg import OccupancyGrid, Odometry
-
-# wheights for NN
-MODEL = YOLO('weights/yolov8n.pt')
-
-_P_2D = []
-_P_3D = []
+from nav_msgs.msg import Odometry, OccupancyGrid
+# from tf_transformations import quaternion_from_euler, euler_from_quaternion
+from tf2_geometry_msgs import *
+from tf2_ros import Time
+from tf2_ros import TransformException
 
 
-T_p = 0
+def euler_from_quaternion(quaternion : Quaternion):
+    """
+    Converts quaternion (w in last place) to euler roll, pitch, yaw
+    quaternion = [x, y, z, w]
+    Bellow should be replaced when porting for ROS 2 Python tf_conversions is done.
+    """
+    x = quaternion.x
+    y = quaternion.y
+    z = quaternion.z
+    w = quaternion.w
 
-bridge = CvBridge()
+    sinr_cosp = 2 * (w * x + y * z)
+    cosr_cosp = 1 - 2 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2 * (w * y - z * x)
+    pitch = np.arcsin(sinp)
+
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+    return roll, pitch, yaw
 
 
-K = np.array([[528.434, 0, 320.5],
-              [0, 528.434, 240.5],
-              [0, 0, 1]])
+def quaternion_from_euler(roll, pitch, yaw):
+    """
+    Converts euler roll, pitch, yaw to quaternion (w in last place)
+    quat = [x, y, z, w]
+    Bellow should be replaced when porting for ROS 2 Python tf_conversions is done.
+    """
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+
+    q = Quaternion()
+    q.x = cy * cp * sr - sy * sp * cr
+    q.y = sy * cp * sr + cy * sp * cr
+    q.z = sy * cp * cr - cy * sp * sr
+    q.w = cy * cp * cr + sy * sp * sr
+
+    return q
+
+def equation_of_line(x1, y1, x2, y2):
+    k = (y2 - y1) / (x2 - x1)
+    b = y1 - k * x1
+    return k, b
 
 class Camera_Subscriber(Node):
 
@@ -35,7 +78,7 @@ class Camera_Subscriber(Node):
 
         super().__init__('camera_subscriber')
 
-        self.SAFE_DISTANCE_ = 2 #meters
+        self.SAFE_DISTANCE_ = 2.0 #meters
 
         self.subscription1 = self.create_subscription(
             RgbPc2,
@@ -45,41 +88,31 @@ class Camera_Subscriber(Node):
         self.subscription1
 
         self.subscription2 = self.create_subscription(
-            LaserScan,
-            '/scan',
-            self.scan_callback,
-            10)
-        self.subscription2
-        
-        self.subscription3 = self.create_subscription(
             Odometry,
             '/odom',
             self.odom_callback,
             10)
-        self.subscription3
+        self.subscription2
         
-        self.subscription4 = self.create_subscription(
+        self.subscription3 = self.create_subscription(
             OccupancyGrid,
             '/map',
             self.map_callback,
             10)
-        self.subscription4
-        
-        self.subscription5 = self.create_subscription(
-            OccupancyGrid,
-            '/map',
-            self.occupancy_grid_callback,
-            10)
-        self.subscription5
-        
+        self.subscription3
+
+        # TF
+        self.tf_buffer = tf2_ros.buffer.Buffer()
+        self.listener = tf2_ros.transform_listener.TransformListener(self.tf_buffer, self)
+
         # Pub
         self.img_publisher_ = self.create_publisher(Image, '/yolo_detection', 10)
         self.rgb_depth_publisher_ = self.create_publisher(RgbDepth, '/rgb_depth_sync', 10)
+        self.rgb_pc2_publisher_ = self.create_publisher(RgbPc2, '/rgb_pointcloud2', 10)
         self.goal_pose_publisher_ = self.create_publisher(PoseStamped, '/goal_pose', 10)
-        self.local_map_publisher_ = self.create_publisher(OccupancyGrid, '/map', 10)
-        self.map_img_publisher_ = self.create_publisher(Image, '/img_map', 10)
+        self.point_publisher_ = self.create_publisher(PointStamped, '/point', 10)
 
-
+        # Time
         T_p_ = self.get_clock().now()
         T_p_ # to prevent unused variable warning
 
@@ -91,41 +124,162 @@ class Camera_Subscriber(Node):
 
         # Variables
         self.odom_ = Odometry()
+        self.map_ = OccupancyGrid()
+        self.P_2D_ = []
+        self.mask_ = []
+        self.P_3D_ = []
+        self.bridge_ = CvBridge()
 
-    def rgb_pc2_callback(self, data):
-              
-        global _P_2D, _P_3D
-        if len(_P_2D) == 0:
-            print('_P_2D is empty')
+        # Wheights for NN
+        self.MODEL_ = YOLO('weights/yolov8n-seg.engine')
+
+    def getBaseLinkAngles(self):
+        try:
+            transform = self.tf_buffer.lookup_transform('base_link', 'map', rclpy.time.Time())
+            q = Quaternion()
+            q.x = transform.transform.rotation.x
+            q.y = transform.transform.rotation.y
+            q.z = transform.transform.rotation.z
+            q.w = transform.transform.rotation.w
+            angles = euler_from_quaternion(q)
+
+            return angles
+        except TransformException as ex:
+            self.get_logger().info(f'Could not transform {1} to {1}: {ex}')
+            return []
+
+    def getBaseLinkPosition(self):
+        try:
+            print("one")
+            transform = self.tf_buffer.lookup_transform('base_link', 'map', rclpy.time.Time())
+            
+            t = Vector3()
+            t.x = transform.transform.translation.x
+            t.y = transform.transform.translation.y
+            t.z = transform.transform.translation.z
+            print("two")
+
+            return t
+        except TransformException as ex:
+            self.get_logger().info(f'Could not transform {1} to {1}: {ex}')
+            return []
+
+    def calcRobotXY(self):
+        h = np.sqrt(np.square(self.P_3D_[2]) + np.square(self.P_3D_[0]))
+        x = ((h - self.SAFE_DISTANCE_) * self.P_3D_[2]) / h
+        y = ((h - self.SAFE_DISTANCE_) * -self.P_3D_[0]) / h
+        return x, y
+
+    def getCoordsFromPC2(self, _data, _x, _y):
+        xyz_array = pointcloud2_to_xyz_array(_data.pc2)
+        P_3D = xyz_array[_data.rgb.width * _y + _x]
+        return P_3D
+    
+    def findMedianValue(self, _data): #, _ul, _lr):
+        array = []
+        
+        # for y in range(_ul[1], _lr[1], 2):
+        #     for x in range(_ul[0], _lr[0], 2):
+        #         d = _data[]
+        #         if d != 0:
+        #             array.append(d)
+        
+        for i in range (len(_data)):
+            array.append(_data[i][2])
+        
+        array.sort()
+        n = len(array)
+        if n != 0:    
+            if n % 2 == 0:
+                return (array[n // 2 - 1] + array[n // 2]) / 2.0
+            else:
+                return array[n // 2]
+        else:
+            return []
+            
+    def humanDepth(self, _data):
+        array = []
+
+        for y in range(0, _data.rgb.height, 1):
+            for x in range(0, _data.rgb.width, 1):
+
+                if self.mask_[y][x] != 0:
+                    array.append(self.getCoordsFromPC2(_data, x, y))
+                    # array.append([1, 1, 1])
+        # print('lenARRAY =', len(array))
+        # print('ARRAY =', array)
+        return array
+
+    def rgb_pc2_callback(self, _data):
+        if len(self.P_2D_) == 0:
+            print('P_2D is empty')
             return None
         
-        xyz_array = pointcloud2_to_xyz_array(data.pc2)
-        _P_3D = xyz_array[data.rgb.width * _P_2D[1] + _P_2D[0]]
-        print('P_3D = ', _P_3D)
 
-        # pose = PoseStamped() : TODO: Change coordinates according to Gazebo axes
-        # pose.pose.position.x = _P_3D[0]
-        # pose.pose.position.y = _P_3D[1]
-        # pose.pose.position.z = self.SAFE_DISTANCE_
+        xyz_array = pointcloud2_to_xyz_array(_data.pc2)
+        self.P_3D_ = xyz_array[_data.rgb.width * self.P_2D_[1] + self.P_2D_[0]]
 
-        # q = Quaternion()
-        # q.setRPY(0, 0, 0)
-        # pose.pose.orientation.x = q.x()
-        # pose.pose.orientation.x = q.y()
-        # pose.pose.orientation.x = q.z()
-        # pose.pose.orientation.x = q.w()
+        humanDepth = self.humanDepth(_data)
+        self.P_3D_[2] = self.findMedianValue(humanDepth)
+        print('P_3D = ', self.P_3D_)
 
+
+        if len(self.P_3D_) != 0:
+
+            goal_pose = PoseStamped()
+            
+            # Goal pose header
+            goal_pose.header.frame_id = 'map'
+            goal_pose.header.stamp = self.get_clock().now().to_msg()
+            
+            # Goal pose local coordinates
+            goal_pose_local_coords = Point()
+            
+            x, y = self.calcRobotXY()
+
+            goal_pose_local_coords.x = x
+            goal_pose_local_coords.y = y
+            goal_pose_local_coords.z = self.odom_.pose.pose.position.z
+
+            # Goal pose point for multiplication
+            goal_pose_local_point = PointStamped()
+            goal_pose_local_point.header.frame_id = 'base_link'
+            goal_pose_local_point.point = goal_pose_local_coords
+
+            # Transform coordinates from base_link to map frame
+            bl2map = self.getTransform()
+            goal_pose_global_point = do_transform_point(goal_pose_local_point, bl2map)
+            target_real_coords = goal_pose_global_point.point
+
+            # Goal pose position
+
+            bl_coords = self.getBaseLinkPosition()  # base_link coords in map coords
+
+            goal_pose.pose.position.x = target_real_coords.x
+            goal_pose.pose.position.y = target_real_coords.y
+            goal_pose.pose.position.z = target_real_coords.z
+
+            # Goal pose orientation
+            curr_robot_angles = self.getBaseLinkAngles()
+            if len(curr_robot_angles) == 3:
+                curr_robot_yaw = curr_robot_angles[2]
+        
+                q = quaternion_from_euler(0, 0, -curr_robot_yaw - self.calcYaw())
+
+                goal_pose.pose.orientation.x = q.x
+                goal_pose.pose.orientation.y = q.y
+                goal_pose.pose.orientation.z = q.z
+                goal_pose.pose.orientation.w = q.w
+
+                self.goal_pose_publisher_.publish(goal_pose)
 
     def cam_callback(self, _rgb, _depth):
-
-        global _P_2D
-
-        rgb = bridge.imgmsg_to_cv2(_rgb, 'bgr8')
+        rgb = self.bridge_.imgmsg_to_cv2(_rgb, 'bgr8')
         cv2.imshow('RGB', rgb)
         cv2.waitKey(20)
 
-        tracker, _P_2D = self.human_tracker(rgb)
-        img_msg = bridge.cv2_to_imgmsg(tracker)
+        tracker, self.mask_, self.P_2D_ = self.human_tracker(rgb)
+        img_msg = self.bridge_.cv2_to_imgmsg(tracker)
         self.img_publisher_.publish(img_msg)
 
         rgb_depth = RgbDepth()
@@ -134,16 +288,19 @@ class Camera_Subscriber(Node):
         self.rgb_depth_publisher_.publish(rgb_depth)
  
     def human_tracker(self, frame):
-        
-        results = MODEL(frame, classes=0)
+        results = self.MODEL_.predict(source=frame, classes=0, save=False)
         frame_ = results[0].plot()
-            
+
+        if results[0].masks == None:
+            return frame, [], []
+        
+        m = results[0].masks.data[0].cpu().numpy() * np.uint(255)        
         boxes = results[0].boxes.xyxy.tolist()
 
-        if not boxes:
-            print('ERROR: No human detected')
-            return frame, []
-
+        if not boxes and not results[0].masks.data[0]:
+            print("ERROR: No human detected")
+            return frame, [], []
+        
         boxes = boxes[0]
         
         # person coordinates
@@ -151,141 +308,52 @@ class Camera_Subscriber(Node):
         Y_p = int(boxes[3] + boxes[1]) // 2
         
         # 2D coordinates vector
-        P_2d = np.array([X_p, Y_p, 1])
+        P_2D = np.array([X_p, Y_p, 1])
 
-        print('Human pixel coordinates: ', P_2d)
-
-        # drawing human body center 
-        cv2.circle(frame_, (X_p, Y_p), 5, (255, 0, 0))
-        return frame_, P_2d
+        print('Human pixel coordinates: ', P_2D)
+        
+        return frame_, m, P_2D
     
     def odom_callback(self, msg : Odometry):
         self.odom_ = msg
     
     def map_callback(self, msg : OccupancyGrid):
-        print('map data size =', len(msg.data))
+        self.map_ = msg
 
-    def drawMap(self, scan):
+    def calcYaw(self):
+        x = self.P_3D_[0]
+        z = self.P_3D_[2]
 
-        map = OccupancyGrid()
-        # Map header
-        map.header.frame_id = 'base_link'
-        map.header.stamp = self.get_clock().now().to_msg()
-        # Map info
-        map.info.resolution = self.SAFE_DISTANCE_ / 60
-        map.info.height = 60
-        map.info.width = 60
-        map.info.origin.orientation = self.odom_.pose.pose.orientation
-        map.info.origin.position.x = self.odom_.pose.pose.position.x + (map.info.resolution * map.info.width / 2)
-        map.info.origin.position.y = self.odom_.pose.pose.position.y
-        map.info.origin.position.z = self.odom_.pose.pose.position.z
+        yaw_angle = np.arctan(x / z)  # radians
+        return yaw_angle
 
-        w = map.info.width
-        h = map.info.height
-        r = map.info.resolution
+    def getTransform(self):
+        try:
+            transform = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+
+            r = Quaternion()
+            r.x = transform.transform.rotation.x
+            r.y = transform.transform.rotation.y
+            r.z = transform.transform.rotation.z
+            r.w = transform.transform.rotation.w
+
+            t = Vector3()
+            t.x = transform.transform.translation.x
+            t.y = transform.transform.translation.y
+            t.z = transform.transform.translation.z
+
+            transform_stamped = TransformStamped()
+            transform_stamped.transform.rotation = r
+            transform_stamped.transform.translation = t
+
+            return transform_stamped
+        except TransformException as ex:
+            self.get_logger().info(
+                        f'Could not transform {1} to {1}: {ex}')
+            pass
+        return TransformStamped()
     
-        # Map data
-        i = 0
-        map.data = []
-        for i in range(3600):
-            map.data.append(-1)
-        map.data[10] = 100
-        # print(len(map.data))
-        # for j in range(h * w):
-        #     for idx in range(360):
-        #         if 0 < scan[idx][0] < 2 or -1 < scan[idx][1] < 1:
-        # #             # if (scan[idx][1] > -1) and (scan[idx][1] < 1) and (scan[idx][0] < 2) and (scan[idx][0] > 0):
-        # #             #     # if scan[idx][1] > (y * r) and scan[idx][1] < (r + (y * r)) and scan[idx][0] > (-1 + (x * r)) and scan[idx][0] < (-1 + r + (x * r)):
-        #             map.data[j] = 100
-        #             print(j, '=', map.data[j])
-
-                        
-        print(map.data)
-        self.local_map_publisher_.publish(map)
-
-    # def drawMap(self, scan):
-    #     map = OccupancyGrid()
-    #     # Map header
-    #     map.header.frame_id = 'base_link'
-    #     map.header.stamp = self.get_clock().now().to_msg()
-    #     # Map info
-    #     map.info.resolution = self.SAFE_DISTANCE_ / 60
-    #     map.info.height = 60
-    #     map.info.width = 60
-    #     map.info.origin.orientation = self.odom_.pose.pose.orientation
-    #     map.info.origin.position.x = self.odom_.pose.pose.position.x - (map.info.resolution * map.info.width / 2)
-    #     map.info.origin.position.y = self.odom_.pose.pose.position.y - (map.info.resolution * map.info.height / 2)
-    #     map.info.origin.position.z = self.odom_.pose.pose.position.z
-
-    #     w = map.info.width
-    #     h = map.info.height
-    #     r = map.info.resolution
-
-    #     # Map data
-    #     map.data = [-1] * (w * h)  # заполняем массив значениями -1
-
-    #     for i in range(len(scan)):
-    #         x = scan[i][0]
-    #         y = scan[i][1]
-    #         if 0 <= x <= 2 and -1 <= y <= 1:
-    #             map.data.append
-
-
-    #     print(map.data)
-    #     self.local_map_publisher_.publish(map)
-
-
-    def scan_callback(self, msg : LaserScan):
-        
-        scan_ranges = msg.ranges
-        angle_min = msg.angle_min
-        inc = msg.angle_increment
-
-        scan_points = []
-        for idx in range (len(scan_ranges)):
-            if str(scan_ranges[idx]) == 'inf':
-                scan_points.append([100, 100])
-
-            else:    
-                angle = angle_min + idx * inc
-                x = scan_ranges[idx] * np.cos(angle)
-                y = scan_ranges[idx] * np.sin(angle)
-                scan_points.append([x, y])
-            # print(idx, '=', scan_points[idx])
-
-
-        map = self.drawMap(scan_points)
-
-    def occupancy_grid_callback(self, msg : OccupancyGrid):
-        # Преобразование OccupancyGrid в массив numpy
-        occupancy_grid_data = msg.data
-        w = msg.info.width
-        h = msg.info.height
-        map_image = np.zeros((h, w), dtype='uint8')
-
-        for y in range(h):
-            for x in range(w):
-                if occupancy_grid_data[y * w + x] == 100:
-                    map_image[y][x] = 0
-                if occupancy_grid_data[y * w + x] == 0:
-                    map_image[y][x] = 255
-                if occupancy_grid_data[y * w + x] == -1:
-                    map_image[y][x] = 128                    
-
-
-        # Преобразование массива numpy в изображение с помощью OpenCV
-        map_image_np = cv2.resize(map_image, (w * 5, h * 5), interpolation=cv2.INTER_NEAREST)
-        map_image_np = cv2.convertScaleAbs(map_image_np, alpha=(255.0/100.0))
-        map_image_np = cv2.cvtColor(map_image_np, cv2.COLOR_GRAY2BGR)
-
-        # Публикация изображения с помощью CvBridge
-        image_msg = bridge.cv2_to_imgmsg(map_image_np, encoding="bgr8")
-        # Публикация изображения
-        self.map_img_publisher_.publish(image_msg)
-        cv2.imshow('MAP', map_image_np)
-        # cv2.circle(map_image_np, (10, 10), 5, (255, 255, 255))
-        cv2.waitKey(1)    
-      
+     
 
 def main(args=None):
 
