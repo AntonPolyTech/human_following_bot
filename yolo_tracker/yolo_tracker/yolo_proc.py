@@ -94,16 +94,10 @@ class Camera_Subscriber(Node):
             10)
         self.subscription2
         
-        self.subscription3 = self.create_subscription(
-            OccupancyGrid,
-            '/map',
-            self.map_callback,
-            10)
-        self.subscription3
-
         # TF
         self.tf_buffer = tf2_ros.buffer.Buffer()
         self.listener = tf2_ros.transform_listener.TransformListener(self.tf_buffer, self)
+        self.tf_ = None
 
         # Pub
         self.img_publisher_ = self.create_publisher(Image, '/yolo_detection', 10)
@@ -115,6 +109,8 @@ class Camera_Subscriber(Node):
         # Time
         T_p_ = self.get_clock().now()
         T_p_ # to prevent unused variable warning
+        timer_period = 10 / 1000  # seconds
+        self.timer = self.create_timer(timer_period, self.getTransform)
 
         # Sync
         self.image_sub_ = message_filters.Subscriber(self, Image, '/camera/image_raw')
@@ -124,8 +120,6 @@ class Camera_Subscriber(Node):
 
         # Variables
         self.odom_ = Odometry()
-        self.map_ = OccupancyGrid()
-        self.P_2D_ = []
         self.mask_ = []
         self.P_3D_ = []
         self.bridge_ = CvBridge()
@@ -134,35 +128,30 @@ class Camera_Subscriber(Node):
         self.MODEL_ = YOLO('weights/yolov8n-seg.engine')
 
     def getBaseLinkAngles(self):
-        try:
-            transform = self.tf_buffer.lookup_transform('base_link', 'map', rclpy.time.Time())
-            q = Quaternion()
-            q.x = transform.transform.rotation.x
-            q.y = transform.transform.rotation.y
-            q.z = transform.transform.rotation.z
-            q.w = transform.transform.rotation.w
-            angles = euler_from_quaternion(q)
+        transform = self.tf_
+        if transform == None:
+            return None
 
-            return angles
-        except TransformException as ex:
-            self.get_logger().info(f'Could not transform {1} to {1}: {ex}')
-            return []
+        q = Quaternion()
+        q.x = transform.transform.rotation.x
+        q.y = transform.transform.rotation.y
+        q.z = transform.transform.rotation.z
+        q.w = transform.transform.rotation.w
+        angles = euler_from_quaternion(q)
+
+        return angles
 
     def getBaseLinkPosition(self):
-        try:
-            print("one")
-            transform = self.tf_buffer.lookup_transform('base_link', 'map', rclpy.time.Time())
-            
-            t = Vector3()
-            t.x = transform.transform.translation.x
-            t.y = transform.transform.translation.y
-            t.z = transform.transform.translation.z
-            print("two")
+        transform = self.tf_
+        if transform == None:
+            return None
+        
+        t = Vector3()
+        t.x = transform.transform.translation.x
+        t.y = transform.transform.translation.y
+        t.z = transform.transform.translation.z
 
-            return t
-        except TransformException as ex:
-            self.get_logger().info(f'Could not transform {1} to {1}: {ex}')
-            return []
+        return t
 
     def calcRobotXY(self):
         h = np.sqrt(np.square(self.P_3D_[2]) + np.square(self.P_3D_[0]))
@@ -170,61 +159,59 @@ class Camera_Subscriber(Node):
         y = ((h - self.SAFE_DISTANCE_) * -self.P_3D_[0]) / h
         return x, y
 
-    def getCoordsFromPC2(self, _data, _x, _y):
-        xyz_array = pointcloud2_to_xyz_array(_data.pc2)
-        P_3D = xyz_array[_data.rgb.width * _y + _x]
-        return P_3D
+    # def getCoordsFromPC2(self, _data, _x, _y):
+    #     xyz_array = pointcloud2_to_xyz_array(_data.pc2)
+    #     P_3D = xyz_array[_data.rgb.width * _y + _x]
+    #     return P_3D
     
-    def findMedianValue(self, _data): #, _ul, _lr):
-        array = []
-        
-        # for y in range(_ul[1], _lr[1], 2):
-        #     for x in range(_ul[0], _lr[0], 2):
-        #         d = _data[]
-        #         if d != 0:
-        #             array.append(d)
-        
-        for i in range (len(_data)):
-            array.append(_data[i][2])
-        
-        array.sort()
-        n = len(array)
-        if n != 0:    
+    def findMedianValue(self, _data : list): #, _ul, _lr):
+        _data.sort()
+        n = len(_data)
+
+        if n != 0:
             if n % 2 == 0:
-                return (array[n // 2 - 1] + array[n // 2]) / 2.0
+                return (_data[n // 2 - 1] + _data[n // 2]) / 2.0
             else:
-                return array[n // 2]
+                return _data[n // 2]
         else:
-            return []
+            return np.array([])
             
     def humanDepth(self, _data):
-        array = []
-
-        for y in range(0, _data.rgb.height, 1):
-            for x in range(0, _data.rgb.width, 1):
-
-                if self.mask_[y][x] != 0:
-                    array.append(self.getCoordsFromPC2(_data, x, y))
-                    # array.append([1, 1, 1])
-        # print('lenARRAY =', len(array))
-        # print('ARRAY =', array)
-        return array
+        flattened_array = self.mask_.flatten()
+        idences = np.where(flattened_array != 0)
+        result = _data[idences][:, 2]
+        return result
+    
+    # ------------------------------------------- R G B P C 2   C A L L B A C K ------------------------------------------- 
 
     def rgb_pc2_callback(self, _data):
-        if len(self.P_2D_) == 0:
+        rgb = self.bridge_.imgmsg_to_cv2(_data.rgb, 'bgr8')
+        h, w = rgb.shape[:2]
+
+        tracker, self.mask_, P_2D = self.human_tracker(rgb)
+        img_msg = self.bridge_.cv2_to_imgmsg(tracker)
+        self.img_publisher_.publish(img_msg)
+
+        if self.tf_ == None:
+            return
+
+        if len(P_2D) == 0:
             print('P_2D is empty')
             return None
         
-
         xyz_array = pointcloud2_to_xyz_array(_data.pc2)
-        self.P_3D_ = xyz_array[_data.rgb.width * self.P_2D_[1] + self.P_2D_[0]]
+        self.P_3D_ = xyz_array[_data.rgb.width * P_2D[1] + P_2D[0]]
 
-        humanDepth = self.humanDepth(_data)
-        self.P_3D_[2] = self.findMedianValue(humanDepth)
-        print('P_3D = ', self.P_3D_)
-
+        humanDepth = self.humanDepth(xyz_array)
 
         if len(self.P_3D_) != 0:
+
+            self.P_3D_[2] = self.findMedianValue(humanDepth)
+
+            if self.P_3D_[2] <= self.SAFE_DISTANCE_:
+                return None
+
+            print('P_3D = ', self.P_3D_)
 
             goal_pose = PoseStamped()
             
@@ -237,6 +224,22 @@ class Camera_Subscriber(Node):
             
             x, y = self.calcRobotXY()
 
+            # # # # # # # # # # # # # # # # # # # # #
+            # Human point TEST 
+            point = PointStamped()
+
+            point.point.x = self.P_3D_[2]
+            point.point.y = -self.P_3D_[0]
+            point.point.z = self.odom_.pose.pose.position.z
+
+            # global_point = do_transform_point(point, bl2map)
+
+            point.header.frame_id = 'base_link'
+            point.header.stamp = self.get_clock().now().to_msg()
+            
+            self.point_publisher_.publish(point)
+            # # # # # # # # # # # # # # # # # # # # #
+
             goal_pose_local_coords.x = x
             goal_pose_local_coords.y = y
             goal_pose_local_coords.z = self.odom_.pose.pose.position.z
@@ -247,24 +250,24 @@ class Camera_Subscriber(Node):
             goal_pose_local_point.point = goal_pose_local_coords
 
             # Transform coordinates from base_link to map frame
-            bl2map = self.getTransform()
-            goal_pose_global_point = do_transform_point(goal_pose_local_point, bl2map)
+            print('TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTf', self.tf_)
+            print('2222222222222222222222222222222222_D', P_2D)
+            goal_pose_global_point = do_transform_point(goal_pose_local_point, self.tf_)
             target_real_coords = goal_pose_global_point.point
 
             # Goal pose position
-
-            bl_coords = self.getBaseLinkPosition()  # base_link coords in map coords
-
             goal_pose.pose.position.x = target_real_coords.x
             goal_pose.pose.position.y = target_real_coords.y
             goal_pose.pose.position.z = target_real_coords.z
+
+            print('PPPPPPPPPPPPPpose', target_real_coords)
 
             # Goal pose orientation
             curr_robot_angles = self.getBaseLinkAngles()
             if len(curr_robot_angles) == 3:
                 curr_robot_yaw = curr_robot_angles[2]
-        
-                q = quaternion_from_euler(0, 0, -curr_robot_yaw - self.calcYaw())
+
+                q = quaternion_from_euler(0, 0, curr_robot_yaw - self.calcYaw())
 
                 goal_pose.pose.orientation.x = q.x
                 goal_pose.pose.orientation.y = q.y
@@ -273,15 +276,9 @@ class Camera_Subscriber(Node):
 
                 self.goal_pose_publisher_.publish(goal_pose)
 
+    # ------------------------------------------- C A M E R A   C A L L B A C K ------------------------------------------- 
+
     def cam_callback(self, _rgb, _depth):
-        rgb = self.bridge_.imgmsg_to_cv2(_rgb, 'bgr8')
-        cv2.imshow('RGB', rgb)
-        cv2.waitKey(20)
-
-        tracker, self.mask_, self.P_2D_ = self.human_tracker(rgb)
-        img_msg = self.bridge_.cv2_to_imgmsg(tracker)
-        self.img_publisher_.publish(img_msg)
-
         rgb_depth = RgbDepth()
         rgb_depth.rgb = _rgb
         rgb_depth.depth = _depth
@@ -311,14 +308,14 @@ class Camera_Subscriber(Node):
         P_2D = np.array([X_p, Y_p, 1])
 
         print('Human pixel coordinates: ', P_2D)
+
+        # drawing human body center 
+        cv2.circle(frame_, (X_p, Y_p), 5, (255, 0, 0), 10)
         
         return frame_, m, P_2D
     
     def odom_callback(self, msg : Odometry):
         self.odom_ = msg
-    
-    def map_callback(self, msg : OccupancyGrid):
-        self.map_ = msg
 
     def calcYaw(self):
         x = self.P_3D_[0]
@@ -328,9 +325,11 @@ class Camera_Subscriber(Node):
         return yaw_angle
 
     def getTransform(self):
+        print('GGGGGGGGGGGGGGGGGGGGGGGGET')
         try:
+            print('EEEEEEEEEEEEEEEEmpty')
             transform = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
-
+            print('LLLLLLLLLLLokup')
             r = Quaternion()
             r.x = transform.transform.rotation.x
             r.y = transform.transform.rotation.y
@@ -346,12 +345,9 @@ class Camera_Subscriber(Node):
             transform_stamped.transform.rotation = r
             transform_stamped.transform.translation = t
 
-            return transform_stamped
+            self.tf_ =  transform_stamped
         except TransformException as ex:
-            self.get_logger().info(
-                        f'Could not transform {1} to {1}: {ex}')
-            pass
-        return TransformStamped()
+            self.get_logger().info(f'Could not transform {1} to {1}: {ex}')
     
      
 
