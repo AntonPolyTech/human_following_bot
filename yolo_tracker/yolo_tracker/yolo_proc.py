@@ -6,10 +6,12 @@ import message_filters
 import rclpy.time
 import tf2_ros
 import math
+import time
 
+from rclpy.duration import Duration
 from ultralytics import YOLO
 from rclpy.node import Node
-from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs.msg import Image, CameraInfo
 from tracker_msgs.msg import RgbPc2, RgbDepth
 from geometry_msgs.msg import Twist, PoseStamped, Quaternion, PointStamped, Vector3
 from cv_bridge import CvBridge
@@ -23,11 +25,6 @@ from .submodules.sort import Sort
 
 
 def euler_from_quaternion(quaternion : Quaternion):
-    """
-    Converts quaternion (w in last place) to euler roll, pitch, yaw
-    quaternion = [x, y, z, w]
-    Bellow should be replaced when porting for ROS 2 Python tf_conversions is done.
-    """
     x = quaternion.x
     y = quaternion.y
     z = quaternion.z
@@ -48,11 +45,6 @@ def euler_from_quaternion(quaternion : Quaternion):
 
 
 def quaternion_from_euler(roll, pitch, yaw):
-    """
-    Converts euler roll, pitch, yaw to quaternion (w in last place)
-    quat = [x, y, z, w]
-    Bellow should be replaced when porting for ROS 2 Python tf_conversions is done.
-    """
     cy = np.cos(yaw * 0.5)
     sy = np.sin(yaw * 0.5)
     cp = np.cos(pitch * 0.5)
@@ -73,9 +65,18 @@ def equation_of_line(x1, y1, x2, y2):
     b = y1 - k * x1
     return k, b
 
+K = np.array([[528.434, 0, 320.5],
+              [0, 528.434, 240.5],
+              [0, 0, 1]])
+
+def str2np(_str : np):
+    return _str.reshape(3, 3)
+
 class Camera_Subscriber(Node):
 
     def __init__(self):
+
+        self.flag = False
 
         super().__init__('camera_subscriber')
 
@@ -98,7 +99,14 @@ class Camera_Subscriber(Node):
             '/cmd_vel',
             self.vel_callback,
             10)
-        self.subscription3      
+        self.subscription3
+
+        self.subscription4 = self.create_subscription(
+            CameraInfo,
+            '/camera/camera_info',
+            self.cam_info_callback,
+            10)
+        self.subscription4
         
         # TF
         self.tf_buffer = tf2_ros.buffer.Buffer()
@@ -111,21 +119,24 @@ class Camera_Subscriber(Node):
         self.rgb_pc2_publisher_ = self.create_publisher(RgbPc2, '/rgb_pointcloud2', 10)
         self.goal_pose_publisher_ = self.create_publisher(PoseStamped, '/goal_pose', 10)
         self.point_publisher_ = self.create_publisher(PointStamped, '/point', 10)
+        self.vel_publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
 
-        # Time
+        # Times
         T_p_ = self.get_clock().now()
         T_p_ # to prevent unused variable warning
         timer_period = 10 / 1000  # seconds
         self.timer = self.create_timer(timer_period, self.getTransform)
+        self.time = []
+        self.count = 0
 
         # Sync
         # # For real robot
-        self.image_sub_ = message_filters.Subscriber(self, Image, '/camera/color/image_raw')
-        self.depth_sub_ = message_filters.Subscriber(self, Image, '/camera/aligned_depth_to_color/image_raw')
+        # self.image_sub_ = message_filters.Subscriber(self, Image, '/camera/color/image_raw')
+        # self.depth_sub_ = message_filters.Subscriber(self, Image, '/camera/aligned_depth_to_color/image_raw')
         
         # # For simulation
-        # self.image_sub_ = message_filters.Subscriber(self, Image, '/camera/image_raw')
-        # self.depth_sub_ = message_filters.Subscriber(self, Image, '/camera/depth/image_raw')
+        self.image_sub_ = message_filters.Subscriber(self, Image, '/camera/image_raw')
+        self.depth_sub_ = message_filters.Subscriber(self, Image, '/camera/depth/image_raw')
         
         self.ts_ = message_filters.TimeSynchronizer([self.image_sub_, self.depth_sub_], 10)
         self.ts_.registerCallback(self.cam_callback)
@@ -133,8 +144,12 @@ class Camera_Subscriber(Node):
         # Variables
         self.odom_ = Odometry()
         self.vel_ = Twist()
-        self.mask_ = np.empty(0)
+        self.cam_info_ = CameraInfo()
+        self.h, self.w = (480, 640)
+        self.mask_ = np.zeros((self.h, self.w, 1), dtype='uint8')
+        self.P_2D_ = np.empty(0)
         self.P_3D_ = np.empty(0)
+        self.prev_yaw_ = 0.0
         self.bridge_ = CvBridge()
         self.tracker_ = Tracker()
         self.color_ = (128, 128, 128)
@@ -146,12 +161,21 @@ class Camera_Subscriber(Node):
         self.bbox_ = np.empty((0, 4), dtype=int)
         self.detection_threshold_ = 0.5
         self.prev_goal_pose_ = None
+        
+        
 
-        self.sort_tracker_ = Sort(max_age=1200, min_hits=8, iou_threshold=0.15)
+        self.sort_tracker_ = Sort(max_age=1200, min_hits=2, iou_threshold=0.1)
 
 
         # Wheights for NN
         self.MODEL_ = YOLO('weights/yolov8n-seg.engine')
+
+    def stopForDelay(self, sec):
+        if self.flag == True:
+            self.flag = False
+            t = time.time()
+            while time.time() - t < sec:
+                self.stop()
 
     def getBaseLinkAngles(self):
         transform = self.tf_
@@ -198,10 +222,14 @@ class Camera_Subscriber(Node):
             return np.array([])
             
     def humanDepth(self, _data):
-        flattened_array = self.mask_.flatten()
-        idences = np.where(flattened_array != 0)
-        result = _data[idences][:, 2]
+        # flattened_array = self.mask_.flatten()
+        mask = self.mask_[(self.w-self.h)//2:self.h+(self.w-self.h)//2, :]
+        indices = np.where(mask.flatten() != 0)
+        result = _data[indices][:, 2]
         return result
+
+    def calcP3D(self, _z):
+        self.P_3D_ = np.dot(_z, np.dot(np.linalg.inv(str2np(self.cam_info_.k)), self.P_2D_))
     
     # -------------------------------------------------------------------------------------- R G B P C 2   C A L L B A C K  
 
@@ -210,7 +238,7 @@ class Camera_Subscriber(Node):
         rgb = self.bridge_.imgmsg_to_cv2(_data.rgb, 'bgr8')
 
         # Getting human pixel coords
-        tracker, self.mask_, P_2D = self.human_tracker(rgb)
+        tracker, self.mask_, self.P_2D_ = self.human_tracker(rgb)
         img_msg = self.bridge_.cv2_to_imgmsg(tracker)
         self.img_publisher_.publish(img_msg)
 
@@ -223,19 +251,19 @@ class Camera_Subscriber(Node):
         if self.tf_ == None:
             return
 
-        if len(P_2D) == 0:
-            print('P_2D is empty')
-            return None
+        # if len(self.P_2D_) == 0:
+        #     # print('P_2D is empty')
+        #     return None
 
         # Getting target human 3D coords   
         xyz_array = pointcloud2_to_xyz_array(_data.pc2)
-        self.P_3D_ = xyz_array[_data.rgb.width * P_2D[1] + P_2D[0]]
-
         humanDepth = self.humanDepth(xyz_array)
 
-        if len(self.P_3D_) != 0:
+        if len(self.P_2D_) != 0:
+            self.flag = True
 
-            self.P_3D_[2] = self.findMedianValue(humanDepth)
+            # self.P_3D_[2] = self.findMedianValue(humanDepth)
+            self.calcP3D(self.findMedianValue(humanDepth))
 
             if self.P_3D_[2] <= self.SAFE_DISTANCE_:
                 return None
@@ -310,7 +338,17 @@ class Camera_Subscriber(Node):
 
                 # if not self.goalPoseReached(self.tf_, goal_pose):
                 self.goal_pose_publisher_.publish(goal_pose)
-                
+            
+        else:
+            if self.prev_yaw_ == 0.0:
+                self.stop()
+            else:
+                self.stopForDelay(2)
+
+                if self.prev_yaw_ > 0.0:
+                    self.turnRight()
+                else:
+                    self.turnLeft()        
 
     # --------------------------------------------------------------------------------------C A M E R A   C A L L B A C K  
 
@@ -321,22 +359,12 @@ class Camera_Subscriber(Node):
         self.rgb_depth_publisher_.publish(rgb_depth)
  
     def human_tracker(self, frame):
-        # results = self.MODEL_.predict(source=frame, classes=0, save=False)
-        # frame_ = results[0].plot()
-
-        # boxes = results[0].boxes.xyxy.tolist()
-
-        # if not boxes and not results[0].masks.data[0]:
-        #     print("ERROR: No human detected")
-        #     return frame, [], []
-        
-        # boxes = boxes[0]
 
         results = self.MODEL_.predict(source=frame, classes=0, save=False)
 
         if not results[0]:
             print("ERROR: No human detected")
-            return frame, np.empty(0), np.empty(0)
+            return frame, np.zeros((self.h, self.w, 1), dtype='uint8'), np.empty(0)
         else:
                 
             m = results[0].masks.data[0].cpu().numpy() * np.uint(255)
@@ -353,6 +381,7 @@ class Camera_Subscriber(Node):
             #     return frame, [], []
 
 # ######################################## D E E P  S O R T
+            # t1 = self.get_clock().now()
 
             # for result in results:
             #     detections = np.empty((0, 5), dtype=int) 
@@ -381,6 +410,12 @@ class Camera_Subscriber(Node):
             #             frame = cv2.putText(frame, f'track_id {track_id}', (int(x1), int(y1)), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0) , 3, cv2.LINE_AA)
             
             # self.getTrack()
+            # t2 = self.get_clock().now()
+            # self.time.append(t2 - t1)
+            # if self.count // 100 == 0:
+            #     print('Time', self.average_frame_time())
+
+            # self.count = self.count + 1
 ######################################################
 
 # ############################################# S O R T
@@ -388,6 +423,7 @@ class Camera_Subscriber(Node):
 
         # SORT
         # sort = Sort(max_age=20, min_hits=8, iou_threshold=0.15)
+        t1 = self.get_clock().now()
 
         detections_list = self.get_results(results)
         
@@ -398,13 +434,6 @@ class Camera_Subscriber(Node):
         res = self.sort_tracker_.update(detections_list)
             
         self.boxes_track_ = res
-        print('REEEEEEEEEEEEEES', res)
-        # self.boxes_track_ = res[:,:-1]
-        # self.boxes_ids_ = res[:,-1].astype(int)
-
-        
-       
-        # frame = self.draw_bounding_boxes_with_id(frame, self.boxes_track_, res[:,-1].astype(int))
         
         for track in self.boxes_track_:
             bbox = track[:-1]
@@ -418,18 +447,20 @@ class Camera_Subscriber(Node):
                 frame
         
         self.getTrack()
+        t2 = self.get_clock().now()
+        self.time.append(t2 - t1)
+        # if self.count // 100 == 0:
+        # print('Time', self.average_frame_time())
+
+        self.count = self.count + 1
 #############################################################
 
-        print('BBOX =', self.bbox_)
+        # print('BBOX =', self.bbox_)
         
         if len(self.bbox_) == 0:
-            print("ERROR: No human detected")
-            return frame, np.empty(0), np.empty(0)
-        
-        # key = cv2.waitKey(1) & 0xFF
-        # if key == ord('q'):  # Нажатие клавиши 'q' для выхода
-        #     cv2.destroyAllWindows()
-        
+            # print("ERROR: No human detected")
+            return frame, np.zeros((self.h, self.w, 1), dtype='uint8'), np.empty(0)
+                
         # person coordinates
         X_p = int(self.bbox_[2] + self.bbox_[0]) // 2
         Y_p = int(self.bbox_[3] + self.bbox_[1]) // 2
@@ -449,10 +480,16 @@ class Camera_Subscriber(Node):
     def vel_callback(self, msg):
         self.vel_ = msg
 
+    def cam_info_callback(self, msg):
+        self.cam_info_ = msg
+
     def calcYaw(self):
         x = self.P_3D_[0]
         z = self.P_3D_[2]
         yaw_angle = np.arctan(x / z)  # radians
+        if len(self.P_3D_) != 0:
+            self.prev_yaw_ = yaw_angle
+        print('yaw', self.prev_yaw_)
         return yaw_angle
 
     def getTransform(self):
@@ -461,7 +498,7 @@ class Camera_Subscriber(Node):
         except TransformException as ex:
             self.get_logger().info(f'Could not transform {1} to {1}: {ex}')
     
-    # def mouse_callback(self, event, x, y, flags, param):
+    # def mouse_callback(self, event, x, y, flags, param):  # deepSORT
     #     self.prev_track_id_ = self.track_id_
     #     if event == cv2.EVENT_LBUTTONDOWN:
     #         self.cursor_coords_ = [x, y]
@@ -472,7 +509,7 @@ class Camera_Subscriber(Node):
     #                     self.track_id_ = tracks[i][0]
     #                     print("track_id", self.track_id_)
 
-    def mouse_callback(self, event, x, y, flags, param):
+    def mouse_callback(self, event, x, y, flags, param):  # SORT 
         self.prev_track_id_ = self.track_id_
         if event == cv2.EVENT_LBUTTONDOWN:
             self.cursor_coords_ = [x, y]
@@ -567,6 +604,56 @@ class Camera_Subscriber(Node):
             cv2.rectangle(img,(int(bbox[0]), int(bbox[1])),(int(bbox[2]), int(bbox[3])),(0,0,255),2)
             cv2.putText(img, "ID: " + str(id_), (int(bbox[0]), int(bbox[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 3)
 
+    def average_frame_time(self):
+        # Преобразуем все длительности в секунды и суммируем
+        total_seconds = sum(duration.nanoseconds / 1e9 for duration in self.time)
+
+        # Делим на количество кадров (предположим, что это 100 кадров)
+        average_frame_time_seconds = total_seconds / len(self.time)
+
+        # Преобразуем результат обратно в Duration
+        average_frame_duration = Duration(seconds=average_frame_time_seconds)
+
+        return average_frame_duration
+
+    def turnRight(self):
+        vel = Twist()
+
+        vel.angular.x = 0.0
+        vel.angular.y = 0.0
+        vel.angular.z = -0.15
+
+        vel.linear.x = 0.0
+        vel.linear.y = 0.0
+        vel.linear.z = 0.0
+        
+        self.vel_publisher_.publish(vel)
+
+    def turnLeft(self):
+        vel = Twist()
+
+        vel.angular.x = 0.0
+        vel.angular.y = 0.0
+        vel.angular.z = 0.15
+
+        vel.linear.x = 0.0
+        vel.linear.y = 0.0
+        vel.linear.z = 0.0
+        
+        self.vel_publisher_.publish(vel)
+    
+    def stop(self):
+        vel = Twist()
+
+        vel.angular.x = 0.0
+        vel.angular.y = 0.0
+        vel.angular.z = 0.0
+
+        vel.linear.x = 0.0
+        vel.linear.y = 0.0
+        vel.linear.z = 0.0
+        
+        self.vel_publisher_.publish(vel)
             
 
 def main(args=None):

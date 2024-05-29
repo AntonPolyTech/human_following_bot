@@ -191,6 +191,7 @@ controller_server:
 local_costmap:
   local_costmap:
     ros__parameters:
+      # map_topic: /rtabmap/map
       update_frequency: 5.0
       publish_frequency: 2.0
       global_frame: odom
@@ -234,6 +235,7 @@ local_costmap:
 global_costmap:
   global_costmap:
     ros__parameters:
+      # map_topic: /rtabmap/map
       update_frequency: 1.0
       publish_frequency: 1.0
       global_frame: map
